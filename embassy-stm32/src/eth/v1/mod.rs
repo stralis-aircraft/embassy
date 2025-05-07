@@ -7,7 +7,7 @@ use core::marker::PhantomData;
 use core::sync::atomic::{fence, Ordering};
 
 use embassy_hal_internal::{into_ref, PeripheralRef};
-use stm32_metapac::eth::vals::{Apcs, Cr, Dm, DmaomrSr, Fes, Ftf, Ifg, MbProgress, Mw, Pbl, Rsf, St, Tsf};
+use stm32_metapac::eth::vals::{Apcs, Cr, Dm, DmaomrSr, Fes, Ftf, Ifg, MbProgress, Mw, Pbl, Rod, Rsf, St, Tsf};
 
 pub(crate) use self::rx_desc::{RDes, RDesRing};
 pub(crate) use self::tx_desc::{TDes, TDesRing};
@@ -161,6 +161,165 @@ impl<'d, T: Instance, P: PHY> Ethernet<'d, T, P> {
             w.set_fes(Fes::FES100); // fast ethernet speed
             w.set_dm(Dm::FULL_DUPLEX); // full duplex
                                        // TODO: Carrier sense ? ECRSFD
+        });
+
+        // Set the mac to pass all multicast packets
+        mac.macffr().modify(|w| {
+            w.set_pam(true);
+        });
+
+        // Note: Writing to LR triggers synchronisation of both LR and HR into the MAC core,
+        // so the LR write must happen after the HR write.
+        mac.maca0hr()
+            .modify(|w| w.set_maca0h(u16::from(mac_addr[4]) | (u16::from(mac_addr[5]) << 8)));
+        mac.maca0lr().write(|w| {
+            w.set_maca0l(
+                u32::from(mac_addr[0])
+                    | (u32::from(mac_addr[1]) << 8)
+                    | (u32::from(mac_addr[2]) << 16)
+                    | (u32::from(mac_addr[3]) << 24),
+            )
+        });
+
+        // pause time
+        mac.macfcr().modify(|w| w.set_pt(0x100));
+
+        // Transfer and Forward, Receive and Forward
+        dma.dmaomr().modify(|w| {
+            w.set_tsf(Tsf::STORE_FORWARD);
+            w.set_rsf(Rsf::STORE_FORWARD);
+        });
+
+        dma.dmabmr().modify(|w| {
+            w.set_pbl(Pbl::PBL32) // programmable burst length - 32 ?
+        });
+
+        // TODO MTU size setting not found for v1 ethernet, check if correct
+
+        let hclk = <T as SealedRccPeripheral>::frequency();
+        let hclk_mhz = hclk.0 / 1_000_000;
+
+        // Set the MDC clock frequency in the range 1MHz - 2.5MHz
+        let clock_range = match hclk_mhz {
+            0..=24 => panic!("Invalid HCLK frequency - should be at least 25 MHz."),
+            25..=34 => Cr::CR_20_35,     // Divide by 16
+            35..=59 => Cr::CR_35_60,     // Divide by 26
+            60..=99 => Cr::CR_60_100,    // Divide by 42
+            100..=149 => Cr::CR_100_150, // Divide by 62
+            150..=216 => Cr::CR_150_168, // Divide by 102
+            _ => {
+                panic!("HCLK results in MDC clock > 2.5MHz even for the highest CSR clock divider")
+            }
+        };
+
+        let pins = [
+            ref_clk.map_into(),
+            mdio.map_into(),
+            mdc.map_into(),
+            crs.map_into(),
+            rx_d0.map_into(),
+            rx_d1.map_into(),
+            tx_d0.map_into(),
+            tx_d1.map_into(),
+            tx_en.map_into(),
+        ];
+
+        let mut this = Self {
+            _peri: peri,
+            pins,
+            phy: phy,
+            station_management: EthernetStationManagement {
+                peri: PhantomData,
+                clock_range: clock_range,
+            },
+            mac_addr,
+            tx: TDesRing::new(&mut queue.tx_desc, &mut queue.tx_buf),
+            rx: RDesRing::new(&mut queue.rx_desc, &mut queue.rx_buf),
+        };
+
+        fence(Ordering::SeqCst);
+
+        let mac = T::regs().ethernet_mac();
+        let dma = T::regs().ethernet_dma();
+
+        mac.maccr().modify(|w| {
+            w.set_re(true);
+            w.set_te(true);
+        });
+        dma.dmaomr().modify(|w| {
+            w.set_ftf(Ftf::FLUSH); // flush transmit fifo (queue)
+            w.set_st(St::STARTED); // start transmitting channel
+            w.set_sr(DmaomrSr::STARTED); // start receiving channel
+        });
+
+        this.rx.demand_poll();
+
+        // Enable interrupts
+        dma.dmaier().modify(|w| {
+            w.set_nise(true);
+            w.set_rie(true);
+            w.set_tie(true);
+        });
+
+        this.phy.phy_reset(&mut this.station_management);
+        this.phy.phy_init(&mut this.station_management);
+
+        interrupt::ETH.unpend();
+        unsafe { interrupt::ETH.enable() };
+
+        this
+    }
+
+    pub fn new_spe<const TX: usize, const RX: usize>(
+        queue: &'d mut PacketQueue<TX, RX>,
+        peri: impl Peripheral<P = T> + 'd,
+        _irq: impl interrupt::typelevel::Binding<interrupt::typelevel::ETH, InterruptHandler> + 'd,
+        ref_clk: impl Peripheral<P = impl RefClkPin<T>> + 'd,
+        mdio: impl Peripheral<P = impl MDIOPin<T>> + 'd,
+        mdc: impl Peripheral<P = impl MDCPin<T>> + 'd,
+        crs: impl Peripheral<P = impl CRSPin<T>> + 'd,
+        rx_d0: impl Peripheral<P = impl RXD0Pin<T>> + 'd,
+        rx_d1: impl Peripheral<P = impl RXD1Pin<T>> + 'd,
+        tx_d0: impl Peripheral<P = impl TXD0Pin<T>> + 'd,
+        tx_d1: impl Peripheral<P = impl TXD1Pin<T>> + 'd,
+        tx_en: impl Peripheral<P = impl TXEnPin<T>> + 'd,
+        phy: P,
+        mac_addr: [u8; 6],
+    ) -> Self {
+        into_ref!(peri, ref_clk, mdio, mdc, crs, rx_d0, rx_d1, tx_d0, tx_d1, tx_en);
+
+        critical_section::with(|_| {
+            RCC.ahb1enr().modify(|w| {
+                w.set_ethen(true);
+                w.set_ethtxen(true);
+                w.set_ethrxen(true);
+            });
+
+            // RMII (Reduced Media Independent Interface)
+            SYSCFG.pmc().modify(|w| w.set_mii_rmii_sel(true));
+        });
+
+        config_pins!(ref_clk, mdio, mdc, crs, rx_d0, rx_d1, tx_d0, tx_d1, tx_en);
+
+        let dma = T::regs().ethernet_dma();
+        let mac = T::regs().ethernet_mac();
+
+        // Reset and wait
+        dma.dmabmr().modify(|w| w.set_sr(true));
+        while dma.dmabmr().read().sr() {}
+
+        mac.maccr().modify(|w| {
+
+            // RM0410, p. 1882; notes 64 bit time for half duplex mode.
+            // Unclear whether this is a minimum, or must be set to 64 bit times.
+            w.set_ifg(Ifg::IFG64); // inter frame gap 64 bit times
+
+            w.set_apcs(Apcs::STRIP); // automatic padding and crc stripping
+            
+            w.set_fes(Fes::FES10);      // 10 Mbsp for 10BASE-T1S
+            w.set_dm(Dm::HALF_DUPLEX);  // Half-duplex for 10BASE-T1S
+
+            w.set_rod(Rod::DISABLED);   // Disable receipt of TX'd frames in half-duplex
         });
 
         // Set the mac to pass all multicast packets
