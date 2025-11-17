@@ -207,7 +207,7 @@ pub struct Config {
     /// Set the pull configuration for the RX pin.
     pub rx_pull: Pull,
 
-    // Set this to true to enable sending LIN synchronous breaks
+    /// Set this to true to enable sending LIN synchronous breaks
     #[cfg(any(usart_v3, usart_v4))]
     pub lin_enable: bool,
 
