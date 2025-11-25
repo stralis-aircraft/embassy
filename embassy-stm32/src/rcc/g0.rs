@@ -1,10 +1,11 @@
 use crate::pac::flash::vals::Latency;
 pub use crate::pac::pwr::vals::Vos as VoltageRange;
 pub use crate::pac::rcc::vals::{
-    Hpre as AHBPrescaler, Pllm as PllPreDiv, Plln as PllMul, Pllp as PllPDiv, Pllq as PllQDiv, Pllr as PllRDiv,
-    Pllsrc as PllSource, Ppre as APBPrescaler, Sw as Sysclk,
+    Hpre as AHBPrescaler, Hsidiv as HsiSysDiv, Pllm as PllPreDiv, Plln as PllMul, Pllp as PllPDiv, Pllq as PllQDiv,
+    Pllr as PllRDiv, Pllsrc as PllSource, Ppre as APBPrescaler, Sw as Sysclk,
 };
 use crate::pac::{FLASH, PWR, RCC};
+use crate::rcc::LSI_FREQ;
 use crate::time::Hertz;
 
 /// HSI speed
@@ -26,6 +27,12 @@ pub struct Hse {
     pub freq: Hertz,
     /// HSE mode.
     pub mode: HseMode,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct Hsi {
+    /// Division factor for HSISYS clock. Default is 1.
+    pub sys_div: HsiSysDiv,
 }
 
 /// PLL Configuration
@@ -58,8 +65,8 @@ pub struct Pll {
 #[non_exhaustive]
 #[derive(Clone, Copy)]
 pub struct Config {
-    /// HSI Enable
-    pub hsi: bool,
+    /// HSI Configuration
+    pub hsi: Option<Hsi>,
 
     /// HSE Configuration
     pub hse: Option<Hse>,
@@ -90,23 +97,30 @@ pub struct Config {
     pub mux: super::mux::ClockMux,
 }
 
-impl Default for Config {
-    #[inline]
-    fn default() -> Config {
+impl Config {
+    pub const fn new() -> Self {
         Config {
-            hsi: true,
+            hsi: Some(Hsi {
+                sys_div: HsiSysDiv::DIV1,
+            }),
             hse: None,
             sys: Sysclk::HSI,
             #[cfg(crs)]
-            hsi48: Some(Default::default()),
+            hsi48: Some(crate::rcc::Hsi48Config::new()),
             pll: None,
             ahb_pre: AHBPrescaler::DIV1,
             apb1_pre: APBPrescaler::DIV1,
             low_power_run: false,
-            ls: Default::default(),
+            ls: crate::rcc::LsConfig::new(),
             voltage_range: VoltageRange::RANGE1,
-            mux: Default::default(),
+            mux: super::mux::ClockMux::default(),
         }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Config {
+        Self::new()
     }
 }
 
@@ -119,7 +133,12 @@ pub struct PllFreq {
 
 pub(crate) unsafe fn init(config: Config) {
     // Turn on the HSI
-    RCC.cr().modify(|w| w.set_hsion(true));
+    RCC.cr().modify(|w| {
+        w.set_hsion(true);
+        if let Some(hsi) = config.hsi {
+            w.set_hsidiv(hsi.sys_div);
+        }
+    });
     while !RCC.cr().read().hsirdy() {}
 
     // Use the HSI clock as system clock during the actual clock setup
@@ -127,9 +146,9 @@ pub(crate) unsafe fn init(config: Config) {
     while RCC.cfgr().read().sws() != Sysclk::HSI {}
 
     // Configure HSI
-    let hsi = match config.hsi {
-        false => None,
-        true => Some(HSI_FREQ),
+    let (hsi, hsisys) = match config.hsi {
+        None => (None, None),
+        Some(hsi) => (Some(HSI_FREQ), Some(HSI_FREQ / hsi.sys_div)),
     };
 
     // Configure HSE
@@ -221,10 +240,17 @@ pub(crate) unsafe fn init(config: Config) {
         })
         .unwrap_or_default();
 
+    let rtc = config.ls.init();
+
     let sys = match config.sys {
-        Sysclk::HSI => unwrap!(hsi),
+        Sysclk::HSI => unwrap!(hsisys),
         Sysclk::HSE => unwrap!(hse),
         Sysclk::PLL1_R => unwrap!(pll.pll_r),
+        Sysclk::LSI => {
+            assert!(config.ls.lsi);
+            LSI_FREQ
+        }
+        Sysclk::LSE => unwrap!(config.ls.lse).frequency,
         _ => unreachable!(),
     };
 
@@ -264,7 +290,7 @@ pub(crate) unsafe fn init(config: Config) {
     while RCC.cfgr().read().sws() != config.sys {}
 
     // Disable HSI if not used
-    if !config.hsi {
+    if config.hsi.is_none() {
         RCC.cr().modify(|w| w.set_hsion(false));
     }
 
@@ -272,8 +298,6 @@ pub(crate) unsafe fn init(config: Config) {
         assert!(sys <= Hertz(2_000_000));
         PWR.cr1().modify(|w| w.set_lpr(true));
     }
-
-    let rtc = config.ls.init();
 
     config.mux.init();
 
@@ -290,8 +314,6 @@ pub(crate) unsafe fn init(config: Config) {
         #[cfg(crs)]
         hsi48: hsi48,
         rtc: rtc,
-        hsi_div_8: hsi.map(|h| h / 8u32),
-        hsi_div_488: hsi.map(|h| h / 488u32),
 
         // TODO
         lsi: None,

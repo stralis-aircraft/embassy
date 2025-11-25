@@ -11,14 +11,13 @@
 #[cfg_attr(not(target_has_atomic = "ptr"), path = "run_queue_critical_section.rs")]
 mod run_queue;
 
-#[cfg_attr(all(cortex_m, target_has_atomic = "8"), path = "state_atomics_arm.rs")]
+#[cfg_attr(all(cortex_m, target_has_atomic = "32"), path = "state_atomics_arm.rs")]
 #[cfg_attr(all(not(cortex_m), target_has_atomic = "8"), path = "state_atomics.rs")]
 #[cfg_attr(not(target_has_atomic = "8"), path = "state_critical_section.rs")]
 mod state;
 
-pub mod timer_queue;
 #[cfg(feature = "trace")]
-mod trace;
+pub mod trace;
 pub(crate) mod util;
 #[cfg_attr(feature = "turbowakers", path = "waker_turbo.rs")]
 mod waker;
@@ -28,14 +27,25 @@ use core::marker::PhantomData;
 use core::mem;
 use core::pin::Pin;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicPtr, Ordering};
-use core::task::{Context, Poll};
+#[cfg(not(feature = "arch-avr"))]
+use core::sync::atomic::AtomicPtr;
+use core::sync::atomic::Ordering;
+use core::task::{Context, Poll, Waker};
+
+use embassy_executor_timer_queue::TimerQueueItem;
+#[cfg(feature = "arch-avr")]
+use portable_atomic::AtomicPtr;
 
 use self::run_queue::{RunQueue, RunQueueItem};
 use self::state::State;
 use self::util::{SyncUnsafeCell, UninitCell};
 pub use self::waker::task_from_waker;
 use super::SpawnToken;
+
+#[no_mangle]
+extern "Rust" fn __embassy_time_queue_item_from_waker(waker: &Waker) -> &'static mut TimerQueueItem {
+    unsafe { task_from_waker(waker).timer_queue_item() }
+}
 
 /// Raw task header for use in task pointers.
 ///
@@ -83,11 +93,17 @@ pub(crate) struct TaskHeader {
     poll_fn: SyncUnsafeCell<Option<unsafe fn(TaskRef)>>,
 
     /// Integrated timer queue storage. This field should not be accessed outside of the timer queue.
-    pub(crate) timer_queue_item: timer_queue::TimerQueueItem,
+    pub(crate) timer_queue_item: TimerQueueItem,
+    #[cfg(feature = "trace")]
+    pub(crate) name: Option<&'static str>,
+    #[cfg(feature = "trace")]
+    pub(crate) id: u32,
+    #[cfg(feature = "trace")]
+    all_tasks_next: AtomicPtr<TaskHeader>,
 }
 
 /// This is essentially a `&'static TaskStorage<F>` where the type of the future has been erased.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TaskRef {
     ptr: NonNull<TaskHeader>,
 }
@@ -109,16 +125,6 @@ impl TaskRef {
         }
     }
 
-    /// # Safety
-    ///
-    /// The result of this function must only be compared
-    /// for equality, or stored, but not used.
-    pub const unsafe fn dangling() -> Self {
-        Self {
-            ptr: NonNull::dangling(),
-        }
-    }
-
     pub(crate) fn header(self) -> &'static TaskHeader {
         unsafe { self.ptr.as_ref() }
     }
@@ -129,9 +135,13 @@ impl TaskRef {
         executor.as_ref().map(|e| Executor::wrap(e))
     }
 
-    /// Returns a reference to the timer queue item.
-    pub fn timer_queue_item(&self) -> &'static timer_queue::TimerQueueItem {
-        &self.header().timer_queue_item
+    /// Returns a mutable reference to the timer queue item.
+    ///
+    /// Safety
+    ///
+    /// This function must only be called in the context of the integrated timer queue.
+    pub unsafe fn timer_queue_item(mut self) -> &'static mut TimerQueueItem {
+        unsafe { &mut self.ptr.as_mut().timer_queue_item }
     }
 
     /// The returned pointer is valid for the entire TaskStorage.
@@ -178,7 +188,13 @@ impl<F: Future + 'static> TaskStorage<F> {
                 // Note: this is lazily initialized so that a static `TaskStorage` will go in `.bss`
                 poll_fn: SyncUnsafeCell::new(None),
 
-                timer_queue_item: timer_queue::TimerQueueItem::new(),
+                timer_queue_item: TimerQueueItem::new(),
+                #[cfg(feature = "trace")]
+                name: None,
+                #[cfg(feature = "trace")]
+                id: 0,
+                #[cfg(feature = "trace")]
+                all_tasks_next: AtomicPtr::new(core::ptr::null_mut()),
             },
             future: UninitCell::uninit(),
         }
@@ -213,6 +229,9 @@ impl<F: Future + 'static> TaskStorage<F> {
         let mut cx = Context::from_waker(&waker);
         match future.poll(&mut cx) {
             Poll::Ready(_) => {
+                #[cfg(feature = "trace")]
+                let exec_ptr: *const SyncExecutor = this.raw.executor.load(Ordering::Relaxed);
+
                 // As the future has finished and this function will not be called
                 // again, we can safely drop the future here.
                 this.future.drop_in_place();
@@ -224,6 +243,9 @@ impl<F: Future + 'static> TaskStorage<F> {
                 // Make sure we despawn last, so that other threads can only spawn the task
                 // after we're done with it.
                 this.raw.state.despawn();
+
+                #[cfg(feature = "trace")]
+                trace::task_end(exec_ptr, &p);
             }
             Poll::Pending => {}
         }
@@ -420,6 +442,9 @@ impl SyncExecutor {
     ///
     /// Same as [`Executor::poll`], plus you must only call this on the thread this executor was created.
     pub(crate) unsafe fn poll(&'static self) {
+        #[cfg(feature = "trace")]
+        trace::poll_start(self);
+
         self.run_queue.dequeue_all(|p| {
             let task = p.header();
 
@@ -539,6 +564,11 @@ impl Executor {
     /// `Spawner`s. You may also copy `Spawner`s.
     pub fn spawner(&'static self) -> super::Spawner {
         super::Spawner::new(self)
+    }
+
+    /// Get a unique ID for this Executor.
+    pub fn id(&'static self) -> usize {
+        &self.inner as *const SyncExecutor as usize
     }
 }
 
