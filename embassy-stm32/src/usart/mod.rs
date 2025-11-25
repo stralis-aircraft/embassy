@@ -239,6 +239,10 @@ pub struct Config {
     /// Set the pin configuration for the DE pin.
     pub de_config: OutputConfig,
 
+    /// Set this to true to enable sending LIN synchronous breaks
+    #[cfg(any(usart_v3, usart_v4))]
+    pub lin_enable: bool,
+
     // private: set by new_half_duplex, not by the user.
     duplex: Duplex,
 }
@@ -283,6 +287,8 @@ impl Default for Config {
             tx_config: OutputConfig::PushPull,
             rts_config: OutputConfig::PushPull,
             de_config: OutputConfig::PushPull,
+            #[cfg(any(usart_v3, usart_v4))]
+            lin_enable: false,
             duplex: Duplex::Full,
         }
     }
@@ -1713,6 +1719,7 @@ fn configure(
             w.set_txinv(config.invert_tx);
             w.set_rxinv(config.invert_rx);
             w.set_swap(config.swap_rx_tx);
+            w.set_linen(config.lin_enable);
         }
     });
 
